@@ -24,13 +24,15 @@ experimental = ["esp-idf-svc/experimental"]
 
 [dependencies]
 log = "0.4"
-esp-idf-svc = { version = "0.51", default-features = false, features = ["std"] }
-
+esp-idf-svc = "0.51"
+esp-idf-sys = { version = "0.36", features = ["native"] }
 anyhow = { version = "1.0", default-features = false }
 lazy_static = { version = "1.5", default-features = false }
 
 [build-dependencies]
 embuild = "0.33"
+
+[package.metadata.esp-idf-sys]
 
 [[package.metadata.esp-idf-sys.extra_components]]
 component_dirs = "src/BMLite"

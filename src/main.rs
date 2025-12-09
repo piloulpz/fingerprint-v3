@@ -3,13 +3,14 @@ use esp_idf_svc::log::EspLogger;
 
 mod fingerprint;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     esp_idf_svc::sys::link_patches();
     EspLogger::initialize_default();
 
     log::info!("=== Test minimal BM-Lite ===");
 
     fingerprint::init()?;
+    //fingerprint::wipe_templates()?;
     fingerprint::enroll_user_if_needed()?;
 
     loop {
