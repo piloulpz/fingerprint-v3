@@ -1,47 +1,104 @@
 use anyhow::{anyhow, Result};
-use core::ptr;
+use core::{ffi::c_char, ptr};
 use lazy_static::lazy_static;
 use std::sync::Mutex;
 
 use esp_idf_svc::sys::bmlite::{
-    console_initparams_t,
+    // GPIO / SPI types et constantes
     gpio_num_t_GPIO_NUM_16,
     gpio_num_t_GPIO_NUM_35,
     gpio_num_t_GPIO_NUM_36,
     gpio_num_t_GPIO_NUM_37,
     gpio_num_t_GPIO_NUM_45,
     gpio_num_t_GPIO_NUM_48,
+    interface_t,
     interface_t_SPI_INTERFACE,
     pin_config_t,
     spi_host_device_t_SPI2_HOST,
-    HCP_arg_t,
-    HCP_comm_t,
-    MTU,
-    // Résultats / status
-    fpc_bep_result_t_FPC_BEP_RESULT_OK,
-    // Fonctions haut niveau BM-Lite
-    bep_enroll_finger,
-    bep_identify_finger,
-    bep_sensor_calibrate,
-    bep_sw_reset,
-    bep_template_get_count,
-    bep_template_remove_all,
-    bep_template_save,
-    // Init plate-forme (SPI + GPIO + reset capteur)
+
+    // Plateforme BM-Lite
     platform_deinit,
     platform_init,
+
+    // Résultats / status
+    fpc_bep_result_t_FPC_BEP_RESULT_OK,
+
+    // MTU fourni par ESP-IDF
+    MTU,
 };
 
-/// Contexte minimal du capteur
+// ======================================================
+// 1) Structs BM-Lite corrigées (d'après hcp_tiny.h)
+// ======================================================
+
+#[repr(C)]
+pub struct HCP_arg_t {
+    pub size: u32,
+    pub data: *mut u8,
+}
+
+#[repr(C)]
+pub struct HCP_comm_t {
+    pub write: Option<unsafe extern "C" fn(u16, *const u8, u32) -> i32>,
+    pub read:  Option<unsafe extern "C" fn(u16, *mut u8, u32) -> i32>,
+    pub phy_rx_timeout: u32,
+    pub pkt_buffer: *mut u8,
+    pub pkt_size_max: u32,
+    pub pkt_size: u32,
+    pub txrx_buffer: *mut u8,
+    pub arg: HCP_arg_t,
+    pub bep_result: i32,
+}
+
+// ======================================================
+// 2) console_initparams_t équivalent Rust
+// ======================================================
+
+#[repr(C)]
+pub struct Params {
+    pub iface: interface_t,
+    pub port: *mut c_char,
+    pub baudrate: u32,
+    pub timeout: u32,
+    pub hcp_comm: *mut HCP_comm_t,
+    pub pins: *mut pin_config_t,
+}
+
+// ======================================================
+// 3) Déclarations externes C (bmlite_if.h)
+// ======================================================
+
+extern "C" {
+    pub fn bep_enroll_finger(chain: *mut HCP_comm_t) -> i32;
+
+    pub fn bep_identify_finger(
+        chain: *mut HCP_comm_t,
+        timeout: u32,
+        template_id: *mut u16,
+        matched: *mut bool,
+    ) -> i32;
+
+    pub fn bep_sensor_calibrate(chain: *mut HCP_comm_t) -> i32;
+    pub fn bep_sw_reset(chain: *mut HCP_comm_t) -> i32;
+
+    pub fn bep_template_get_count(chain: *mut HCP_comm_t, count: *mut u16) -> i32;
+    pub fn bep_template_remove_all(chain: *mut HCP_comm_t) -> i32;
+    pub fn bep_template_save(chain: *mut HCP_comm_t, id: u16) -> i32;
+    pub fn sensor_wait_finger_not_present(chain: *mut HCP_comm_t, timeout: u16) -> i32;
+    pub fn sensor_wait_finger_present(chain: *mut HCP_comm_t, timeout: u16) -> i32;
+}
+
+// ======================================================
+// 4) Contexte global du capteur
+// ======================================================
+
 struct SensorCtx {
-    params: *mut console_initparams_t,
+    params: *mut Params,
     pins: *mut pin_config_t,
     chain: *mut HCP_comm_t,
     initialized: bool,
 }
 
-// On garantit au compilateur que ce type peut être partagé/envoyé entre threads.
-// Sur ESP32 avec notre usage contrôlé (tout passe par le Mutex), c’est ok.
 unsafe impl Send for SensorCtx {}
 unsafe impl Sync for SensorCtx {}
 
@@ -55,7 +112,7 @@ impl SensorCtx {
         }
     }
 
-    fn set(&mut self, params: *mut console_initparams_t, pins: *mut pin_config_t, chain: *mut HCP_comm_t) {
+    fn set(&mut self, params: *mut Params, pins: *mut pin_config_t, chain: *mut HCP_comm_t) {
         self.params = params;
         self.pins = pins;
         self.chain = chain;
@@ -78,7 +135,10 @@ lazy_static! {
     static ref SENSOR_CTX: Mutex<SensorCtx> = Mutex::new(SensorCtx::new());
 }
 
-/// Helper pour checker les codes de retour C
+// ======================================================
+// 5) Helper pour erreurs
+// ======================================================
+
 fn check_bep(res: i32, what: &str) -> Result<()> {
     if res == fpc_bep_result_t_FPC_BEP_RESULT_OK {
         Ok(())
@@ -87,18 +147,11 @@ fn check_bep(res: i32, what: &str) -> Result<()> {
     }
 }
 
-/// Alloue et configure les structs C : HCP_comm_t, pin_config_t, console_initparams_t.
-///
-/// Les pins / SPI sont ceux que tu utilisais déjà :
-/// - SPI2
-/// - CS   = GPIO45
-/// - MISO = GPIO37
-/// - MOSI = GPIO35
-/// - CLK  = GPIO36
-/// - RST  = GPIO48 (active bas)
-/// - IRQ  = GPIO16 (active haut)
-unsafe fn alloc_config() -> Result<(*mut console_initparams_t, *mut pin_config_t, *mut HCP_comm_t)> {
-    // Buffers pour la couche HCP
+// ======================================================
+// 6) Création des structs C (Params + HCP_comm + pin_config)
+// ======================================================
+
+unsafe fn alloc_config() -> Result<(*mut Params, *mut pin_config_t, *mut HCP_comm_t)> {
     let pkt_buffer = Box::into_raw(Box::new([0u8; 1024 * 3])) as *mut u8;
     let txrx_buffer = Box::into_raw(Box::new([0u8; MTU as usize])) as *mut u8;
 
@@ -107,10 +160,10 @@ unsafe fn alloc_config() -> Result<(*mut console_initparams_t, *mut pin_config_t
         read: None,
         phy_rx_timeout: 2000,
         pkt_buffer,
-        pkt_size: 0,
         pkt_size_max: 1024 * 3,
+        pkt_size: 0,
         txrx_buffer,
-        arg: HCP_arg_t::default(),
+        arg: HCP_arg_t { size: 0, data: ptr::null_mut() },
         bep_result: 0,
     }));
 
@@ -124,21 +177,22 @@ unsafe fn alloc_config() -> Result<(*mut console_initparams_t, *mut pin_config_t
         spi_clk_pin: gpio_num_t_GPIO_NUM_36,
     }));
 
-    let params = Box::into_raw(Box::new(console_initparams_t {
+    let params = Box::into_raw(Box::new(Params {
         iface: interface_t_SPI_INTERFACE,
         port: ptr::null_mut(),
-        baudrate: 5_000_000,
+        baudrate: 1_000_000, // plus stable pour test
         timeout: 3000,
-        pins,
         hcp_comm: chain,
+        pins,
     }));
 
     Ok((params, pins, chain))
 }
 
-/// Initialisation minimale du BM-Lite :
-/// - configure SPI + GPIO via `platform_init`
-/// - fait un reset du capteur dans `platform_init` / `platform_bmlite_reset`
+// ======================================================
+// 7) API Publique
+// ======================================================
+
 pub fn init() -> Result<()> {
     let mut ctx = SENSOR_CTX.lock().unwrap();
 
@@ -149,132 +203,130 @@ pub fn init() -> Result<()> {
     unsafe {
         let (params, pins, chain) = alloc_config()?;
 
-        // platform_init(void *params) -> fpc_bep_result_t
-        let res = platform_init(params.cast());
-        check_bep(res, "platform_init")?;
+        check_bep(platform_init(params.cast()), "platform_init")?;
 
         ctx.set(params, pins, chain);
+
+        log::info!("sizeof(HCP_comm_t) = {}", core::mem::size_of::<HCP_comm_t>());
+        log::info!("chain ptr      = {:p}", chain);
+        log::info!("pkt_buffer     = {:p}", (*chain).pkt_buffer);
+        log::info!("txrx_buffer    = {:p}", (*chain).txrx_buffer);
+        log::info!("pkt_size_max   = {}", (*chain).pkt_size_max);
+        log::info!("After platform_init:");
+        log::info!("write ptr = {:?}", (*chain).write);
+        log::info!("read ptr  = {:?}", (*chain).read);
+
+        log::info!("Calibration du capteur...");
+    //unsafe { check_bep(bep_sensor_calibrate(ctx.chain), "bep_sensor_calibrate")?; }
     }
 
     log::info!("BM-Lite: init OK");
     Ok(())
 }
 
-/// Vérifie si exactement un template est stocké dans le capteur (ID peu importe).
 pub fn is_user_enrolled() -> Result<bool> {
     let ctx = SENSOR_CTX.lock().unwrap();
     if !ctx.is_set() {
         return Err(anyhow!("BM-Lite not initialized"));
     }
-
     let mut count: u16 = 0;
-    let res = unsafe { bep_template_get_count(ctx.chain, &mut count) };
-    check_bep(res, "bep_template_get_count")?;
-
-    Ok(count == 1)
+    unsafe { check_bep(bep_template_get_count(ctx.chain, &mut count), "bep_template_get_count")?; }
+    Ok(count > 0)
 }
 
-/// Efface tous les templates stockés dans le BM-Lite.
 pub fn wipe_templates() -> Result<()> {
     let ctx = SENSOR_CTX.lock().unwrap();
     if !ctx.is_set() {
         return Ok(());
     }
-
-    let res = unsafe { bep_template_remove_all(ctx.chain) };
-    check_bep(res, "bep_template_remove_all")?;
-
+    unsafe { check_bep(bep_template_remove_all(ctx.chain), "bep_template_remove_all")?; }
     Ok(())
 }
+//il faudra changer ça de place
+use std::{thread, time::Duration};
 
-/// Enrôle un utilisateur si aucun n’est présent.
-/// - Calibrage
-/// - Reset logiciel
-/// - Enrôlement (bep_enroll_finger gère les captures / prompts)
-/// - Sauvegarde en template ID = 1
-pub fn enroll_user_if_needed() -> Result<()> {
-    let mut ctx = SENSOR_CTX.lock().unwrap();
-
+pub fn enroll_user() -> Result<()> {
+    let ctx = SENSOR_CTX.lock().unwrap();
     if !ctx.is_set() {
-        drop(ctx); // libère le lock
-        init()?;
-        ctx = SENSOR_CTX.lock().unwrap();
+        return Err(anyhow!("BM-Lite not initialized"));
     }
 
-    // Vérifie s'il y a déjà un template
+    log::info!("Enrôlement : pose ton doigt...");
+
+    // 1) Enrôlement
+    unsafe {
+        check_bep(
+            bep_enroll_finger(ctx.chain),
+            "bep_enroll_finger",
+        )?;
+
+        // 2) Sauvegarde du template
+        check_bep(
+            bep_template_save(ctx.chain, 1),
+            "bep_template_save",
+        )?;
+    }
+
+    // 3) Vérification que le template est bien stocké
     let mut count: u16 = 0;
-    let res = unsafe { bep_template_get_count(ctx.chain, &mut count) };
-    check_bep(res, "bep_template_get_count")?;
+    unsafe {
+        check_bep(
+            bep_template_get_count(ctx.chain, &mut count),
+            "bep_template_get_count après save",
+        )?;
+    }
+    log::info!("Templates après save: {}", count);
 
-    if count > 0 {
-        log::warn!("BM-Lite: un template existe déjà (count = {count}), on n'enrôle pas.");
-        return Ok(());
+    // 4) TRÈS IMPORTANT :
+    // attendre que le doigt soit retiré avant toute identification
+    log::info!("Enrôlement terminé. Lève ton doigt...");
+    unsafe {
+        check_bep(
+            sensor_wait_finger_not_present(ctx.chain, 5000),
+            "sensor_wait_finger_not_present",
+        )?;
     }
 
-    log::info!("BM-Lite: calibration capteur...");
-    let res = unsafe { bep_sensor_calibrate(ctx.chain) };
-    check_bep(res, "bep_sensor_calibrate")?;
-
-    log::info!("BM-Lite: reset logiciel...");
-    let res = unsafe { bep_sw_reset(ctx.chain) };
-    check_bep(res, "bep_sw_reset")?;
-
-    log::info!("BM-Lite: enrôlement, pose ton doigt plusieurs fois...");
-    let res = unsafe { bep_enroll_finger(ctx.chain) };
-    check_bep(res, "bep_enroll_finger")?;
-
-    // On sauvegarde sous l’ID = 1
-    let template_id: u16 = 1;
-    let res = unsafe { bep_template_save(ctx.chain, template_id) };
-    check_bep(res, "bep_template_save")?;
-
-    log::info!("BM-Lite: enrôlement terminé, template ID = {template_id}");
+    // 5) Petite pause pour laisser le module se stabiliser
+    thread::sleep(Duration::from_millis(150));
 
     Ok(())
 }
 
-/// Un seul test de doigt :
-/// - timeout en ms
-/// - retourne Ok(true) si le doigt correspond à un template (ID peu importe)
-/// - Ok(false) si "pas de match"
-/// - Err(..) si erreur de com / capteur
 pub fn check_once(timeout_ms: u32) -> Result<bool> {
     let ctx = SENSOR_CTX.lock().unwrap();
     if !ctx.is_set() {
         return Err(anyhow!("BM-Lite not initialized"));
     }
 
-    let mut template_id: u16 = 0;
-    let mut matched: bool = false;
+    // 1) Attendre que le doigt soit posé
+    let t: u16 = timeout_ms.min(65_535) as u16;
+    unsafe {
+        check_bep(
+            sensor_wait_finger_present(ctx.chain, t),
+            "sensor_wait_finger_present",
+        )?;
+    }
 
-    // C côté bmlite_if: capture + extract + identify + ARG_MATCH/ARG_ID
-    let res = unsafe { bep_identify_finger(ctx.chain, timeout_ms, &mut template_id, &mut matched) };
-    check_bep(res, "bep_identify_finger")?;
+    // 2) Identifier
+    let mut tid: u16 = 0;
+    let mut matched = false;
+    unsafe {
+        check_bep(
+            bep_identify_finger(ctx.chain, timeout_ms, &mut tid, &mut matched),
+            "bep_identify_finger",
+        )?;
+    }
+
+    // 3) Attendre que le doigt soit retiré 
+    unsafe {
+        let _ = sensor_wait_finger_not_present(ctx.chain, 5000);
+    }
 
     if matched {
-        log::info!("BM-Lite: doigt reconnu, template ID = {template_id}");
-    } else {
-        log::info!("BM-Lite: doigt NON reconnu");
+        log::info!("Matched template id = {}", tid);
     }
 
     Ok(matched)
 }
 
-/// Optionnel : deinit propre si tu veux arrêter le capteur
-pub fn deinit() -> Result<()> {
-    let mut ctx = SENSOR_CTX.lock().unwrap();
-
-    if !ctx.is_set() {
-        return Ok(());
-    }
-
-    unsafe {
-        let res = platform_deinit(ctx.params.cast());
-        check_bep(res, "platform_deinit")?;
-    }
-
-    ctx.reset();
-    log::info!("BM-Lite: deinit OK");
-
-    Ok(())
-}
